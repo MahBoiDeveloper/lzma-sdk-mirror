@@ -7,6 +7,7 @@ import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from lxml import html
@@ -95,13 +96,12 @@ def validate_root(name):
         raise ValueError(f"Reserved or invalid SDK root entry: {name!r}")
 
 
-def mirror(previous):
+def mirror(previous, archive):
     with TemporaryDirectory(prefix="lzma-sdk-") as work:
         work = Path(work)
         page = work / "sdk.html"
         download(SDK_PAGE, page)
         version, archive_url, readme = parse_page(page.read_bytes())
-        archive = work / "sdk.7z"
         download(archive_url, archive)
         with archive.open("rb") as stream:
             if stream.read(6) != bytes.fromhex("37 7a bc af 27 1c"):
@@ -158,23 +158,62 @@ def mirror(previous):
         return state
 
 
-def publish_release(state):
-    version = state["version"]
-    sha256 = state["sha256"]
-    tag = f"v{version}-{sha256[:12]}"
-    endpoint = f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}/releases'
+def github_request(url, *, method="GET", data=None, content_type="application/json"):
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f'Bearer {os.environ["GH_TOKEN"]}',
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if isinstance(data, dict):
+        data = json.dumps(data).encode("utf-8")
+    if data is not None:
+        headers["Content-Type"] = content_type
+    request = Request(url, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=60) as response:
+        return None if response.status == 204 else json.load(response)
+
+
+def find_release(endpoint, tag):
     try:
-        with urlopen(Request(f"{endpoint}/tags/{tag}", headers=headers), timeout=30):
-            return
+        return github_request(f"{endpoint}/tags/{tag}")
     except HTTPError as error:
         if error.code != 404:
             raise
 
+    # The tag endpoint only finds published releases.
+    page = 1
+    while True:
+        releases = github_request(f"{endpoint}?per_page=100&page={page}")
+        for release in releases:
+            if release["tag_name"] == tag:
+                return release
+        if len(releases) < 100:
+            return None
+        page += 1
+
+
+def release_archive_bytes(state, archive):
+    if archive is not None:
+        data = archive.read_bytes()
+    else:
+        with TemporaryDirectory(prefix="lzma-release-") as work:
+            saved_archive = Path(work) / "sdk.7z"
+            try:
+                download(state["archive_url"], saved_archive)
+            except subprocess.CalledProcessError:
+                print(f'::warning::Could not download the original archive for LZMA SDK {state["version"]}')
+                return None
+            data = saved_archive.read_bytes()
+
+    if hashlib.sha256(data).hexdigest() == state["sha256"]:
+        return data
+    if archive is not None:
+        raise ValueError("The SDK archive changed after import")
+    print(f'::warning::The original archive for LZMA SDK {state["version"]} no longer matches its recorded SHA-256')
+    return None
+
+
+def create_draft(endpoint, tag, state):
     commit = subprocess.check_output(
         ["git", "log", "-1", "--format=%H", "--", LOCK], text=True,
     ).strip()
@@ -183,20 +222,49 @@ def publish_release(state):
     payload = {
         "tag_name": tag,
         "target_commitish": commit,
-        "name": f"LZMA SDK {version}",
+        "name": f'LZMA SDK {state["version"]}',
         "body": (
             f'[Official SDK page]({SDK_PAGE}) · [Original 7z archive]({state["archive_url"]})\n\n'
-            f"SHA-256: `{sha256}`"
+            f'SHA-256: `{state["sha256"]}`'
         ),
-        "make_latest": "true",
+        "draft": True,
     }
-    request = Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={**headers, "Content-Type": "application/json"},
-    )
-    with urlopen(request, timeout=30) as response:
-        print(f'Published {json.load(response)["html_url"]}')
+    return github_request(endpoint, method="POST", data=payload)
+
+
+def publish_release(state, archive=None):
+    version = state["version"]
+    sha256 = state["sha256"]
+    tag = f"v{version}-{sha256[:12]}"
+    endpoint = f'{os.environ["GITHUB_API_URL"]}/repos/{os.environ["GITHUB_REPOSITORY"]}/releases'
+    name = Path(urlsplit(state["archive_url"]).path).name
+    release = find_release(endpoint, tag)
+    asset = next((item for item in release["assets"] if item["name"] == name), None) if release else None
+
+    if asset is None or asset["state"] == "starter":
+        if release and release.get("immutable"):
+            print(f"::warning::GitHub does not allow adding {name} to the immutable release {tag}")
+            return
+        data = release_archive_bytes(state, archive)
+        if data is None:
+            return
+        if release is None:
+            release = create_draft(endpoint, tag, state)
+        if asset is not None:
+            github_request(f'{endpoint}/assets/{asset["id"]}', method="DELETE")
+        upload_url = release["upload_url"].split("{", 1)[0] + "?" + urlencode({"name": name})
+        asset = github_request(
+            upload_url, method="POST", data=data, content_type="application/x-7z-compressed",
+        )
+        print(f"Uploaded {name} to {tag}")
+
+    if asset["state"] != "uploaded" or asset.get("digest") not in (None, f"sha256:{sha256}"):
+        raise RuntimeError(f"Unexpected state or SHA-256 for {name} on release {tag}")
+    if release["draft"]:
+        published = github_request(
+            f'{endpoint}/{release["id"]}', method="PATCH", data={"draft": False, "make_latest": "true"},
+        )
+        print(f'Published {published["html_url"]}')
 
 
 def main():
@@ -207,23 +275,25 @@ def main():
     if previous:
         publish_release(previous)
 
-    state = mirror(previous)
-    changed = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode
-    if changed == 0:
-        print("The SDK and README are up to date")
-        return
-    if changed != 1:
-        raise RuntimeError("Could not inspect staged changes")
+    with TemporaryDirectory(prefix="lzma-archive-") as work:
+        archive = Path(work) / "sdk.7z"
+        state = mirror(previous, archive)
+        changed = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode
+        if changed == 0:
+            print("The SDK and README are up to date")
+            return
+        if changed != 1:
+            raise RuntimeError("Could not inspect staged changes")
 
-    sdk_changed = previous is None or any(state[key] != previous[key] for key in ("version", "sha256"))
-    message = f'Sync LZMA SDK {state["version"]}' if sdk_changed else "Refresh the LZMA SDK mirror"
-    subprocess.run(
-        ["git", "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}", "commit", "-m", message],
-        check=True,
-    )
-    subprocess.run(["git", "push", "origin", f'HEAD:refs/heads/{os.environ["TARGET_BRANCH"]}'], check=True)
-    if sdk_changed:
-        publish_release(state)
+        sdk_changed = previous is None or any(state[key] != previous[key] for key in ("version", "sha256"))
+        message = f'Sync LZMA SDK {state["version"]}' if sdk_changed else "Refresh the LZMA SDK mirror"
+        subprocess.run(
+            ["git", "-c", f"user.name={BOT_NAME}", "-c", f"user.email={BOT_EMAIL}", "commit", "-m", message],
+            check=True,
+        )
+        subprocess.run(["git", "push", "origin", f'HEAD:refs/heads/{os.environ["TARGET_BRANCH"]}'], check=True)
+        if sdk_changed:
+            publish_release(state, archive)
 
 
 if __name__ == "__main__":
